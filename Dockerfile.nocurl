@@ -1,0 +1,48 @@
+# Stage 1: Build oauth2-proxy from source with PR #3333 + PR #3336 patches applied
+# NO curl needed - uses built-in "oauth2-proxy health" subcommand for healthchecks
+FROM golang:1.25-bookworm AS builder
+
+ARG VERSION=v7.14.2
+
+WORKDIR /go/src/github.com/oauth2-proxy/oauth2-proxy
+
+# Clone the specific release tag
+RUN git clone --branch ${VERSION} --depth 1 https://github.com/oauth2-proxy/oauth2-proxy.git .
+
+# Apply PR #3333 patch: invalidate session on fatal OAuth2 refresh errors
+COPY pr-3333.patch /tmp/pr-3333.patch
+RUN git apply /tmp/pr-3333.patch
+
+# Apply PR #3336 patch: built-in health check subcommand (replaces curl)
+COPY pr-3336.patch /tmp/pr-3336.patch
+RUN git apply /tmp/pr-3336.patch
+
+# Download dependencies
+RUN go mod download
+
+# Build the binary
+RUN CGO_ENABLED=0 go build -a -installsuffix cgo \
+    -ldflags="-X github.com/oauth2-proxy/oauth2-proxy/v7/pkg/version.VERSION=${VERSION}-patched" \
+    -o oauth2-proxy \
+    github.com/oauth2-proxy/oauth2-proxy/v7
+
+# Create empty jwt signing key file (needed for GCP App Engine compatibility)
+RUN touch jwt_signing_key.pem
+
+# Stage 2: Runtime distroless image - NO curl, NO Alpine stage
+FROM gcr.io/distroless/static:nonroot
+
+# Copy patched oauth2-proxy binary (includes built-in health check)
+COPY --from=builder /go/src/github.com/oauth2-proxy/oauth2-proxy/oauth2-proxy /bin/oauth2-proxy
+COPY --from=builder /go/src/github.com/oauth2-proxy/oauth2-proxy/jwt_signing_key.pem /etc/ssl/private/jwt_signing_key.pem
+
+LABEL org.opencontainers.image.licenses=MIT \
+      org.opencontainers.image.description="oauth2-proxy v7.14.2 with PR #3333 (session invalidation) + PR #3336 (built-in healthcheck) - no curl" \
+      org.opencontainers.image.source=https://github.com/oauth2-proxy/oauth2-proxy \
+      org.opencontainers.image.title=oauth2-proxy-patched-nocurl
+
+# Built-in health check (no curl needed)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["/bin/oauth2-proxy", "health"]
+
+ENTRYPOINT ["/bin/oauth2-proxy"]
